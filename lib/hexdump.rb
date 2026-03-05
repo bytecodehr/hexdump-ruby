@@ -3,12 +3,12 @@ require 'net/http'
 require 'uri'
 require 'securerandom'
 
-require_relative 'bugclaw/configuration'
-require_relative 'bugclaw/transport'
-require_relative 'bugclaw/context'
-require_relative 'bugclaw/middleware'
-require_relative 'bugclaw/railtie' if defined?(Rails::Railtie)
-require_relative 'bugclaw/sidekiq' if defined?(Sidekiq)
+require_relative 'hexdump/configuration'
+require_relative 'hexdump/transport'
+require_relative 'hexdump/context'
+require_relative 'hexdump/middleware'
+require_relative 'hexdump/railtie' if defined?(Rails::Railtie)
+require_relative 'hexdump/sidekiq' if defined?(Sidekiq)
 
 module Hexdump
   class << self
