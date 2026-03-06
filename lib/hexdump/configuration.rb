@@ -5,7 +5,7 @@ module Hexdump
                   :enabled
 
     def initialize
-      @endpoint = ENV['HEXDUMP_ENDPOINT']
+      @endpoint = ENV['HEXDUMP_ENDPOINT'] || 'https://hexdump.app'
       @api_key = ENV['HEXDUMP_API_KEY']
       @environment = ENV['RAILS_ENV'] || ENV['RACK_ENV'] || 'development'
       @git_sha = ENV['GIT_SHA'] || ENV['HEROKU_SLUG_COMMIT'] || `git rev-parse --short HEAD 2>/dev/null`.strip
