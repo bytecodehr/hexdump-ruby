@@ -11,18 +11,43 @@ permissions:
 jobs:
   review:
     runs-on: ubuntu-latest
+    if: "!contains(github.event.pull_request.title, '[no-review]') && !contains(github.event.pull_request.title, '[wip]')"
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Get PR diff
-        id: diff
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Syntax check changed Ruby files
+        id: syntax
         run: |
           git fetch origin ${{ github.event.pull_request.base.ref }}
-          DIFF=$(git diff origin/${{ github.event.pull_request.base.ref }}...HEAD)
-          # Save to file (env vars have size limits)
-          echo "$DIFF" > /tmp/pr_diff.txt
+          CHANGED=$(git diff --name-only origin/${{ github.event.pull_request.base.ref }}...HEAD -- '*.rb')
+          ERRORS=""
+          for f in $CHANGED; do
+            if [ -f "$f" ]; then
+              RESULT=$(ruby -c "$f" 2>&1) || ERRORS="${ERRORS}\n❌ ${f}: ${RESULT}"
+            fi
+          done
+          if [ -n "$ERRORS" ]; then
+            echo "errors<<EOF" >> $GITHUB_OUTPUT
+            echo -e "$ERRORS" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get PR diff and context
+        id: context
+        run: |
+          git diff origin/${{ github.event.pull_request.base.ref }}...HEAD > /tmp/pr_diff.txt
+          DIFF_LINES=$(wc -l < /tmp/pr_diff.txt)
+          echo "diff_lines=$DIFF_LINES" >> $GITHUB_OUTPUT
+
+          # Get list of all files for full codebase context
+          find lib -name '*.rb' -exec cat {} + > /tmp/full_codebase.txt 2>/dev/null || true
 
       - name: AI Code Review
         env:
@@ -30,62 +55,58 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          DIFF_LINES: ${{ steps.context.outputs.diff_lines }}
+          SYNTAX_ERRORS: ${{ steps.syntax.outputs.errors }}
         run: |
-          DIFF=$(cat /tmp/pr_diff.txt)
+          DIFF=$(head -c 80000 /tmp/pr_diff.txt)
+          CODEBASE=$(head -c 40000 /tmp/full_codebase.txt)
 
-          # Skip if diff is empty
-          if [ -z "$DIFF" ]; then
-            echo "No changes to review"
+          # Skip tiny diffs (< 3 lines)
+          if [ "$DIFF_LINES" -lt 3 ]; then
+            echo "Diff too small ($DIFF_LINES lines), skipping review"
             exit 0
           fi
 
-          # Truncate very large diffs
-          DIFF=$(echo "$DIFF" | head -c 50000)
-
-          PROMPT=$(cat <<'REVIEW_PROMPT'
-          You are a senior Ruby developer reviewing a pull request for a Ruby gem called Hexdump (self-hosted error tracking + logging with local AI).
-
-          Review the diff below and provide:
-
-          ## 🔴 Blocking Issues
-          Critical bugs, security vulnerabilities, data loss risks, broken functionality.
-
-          ## ⚠️ Warnings
-          Code smells, missing edge cases, performance concerns, thread safety issues.
-
-          ## 💡 Suggestions
-          Improvements, better patterns, Ruby idioms, test coverage gaps.
-
-          ## ✅ What Looks Good
-          Briefly note well-written parts.
-
-          Rules:
-          - Be specific — reference file names and line numbers
-          - For Ruby gems: check thread safety, memory leaks, exception handling
-          - Check for credentials/secrets accidentally committed
-          - If changes look fine, say so briefly — don't invent issues
-          - Use GitHub-flavored markdown
-          - Keep it concise and actionable
-          REVIEW_PROMPT
-          )
+          SYNTAX_CONTEXT=""
+          if [ -n "$SYNTAX_ERRORS" ]; then
+            SYNTAX_CONTEXT="SYNTAX CHECK FAILURES (these are real errors from ruby -c):\n${SYNTAX_ERRORS}\n\nThese MUST be flagged as critical."
+          fi
 
           REVIEW=$(curl -s https://api.anthropic.com/v1/messages \
             -H "content-type: application/json" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
             -d "$(jq -n \
-              --arg prompt "$PROMPT" \
               --arg diff "$DIFF" \
+              --arg codebase "$CODEBASE" \
+              --arg syntax "$SYNTAX_CONTEXT" \
+              --arg diff_lines "$DIFF_LINES" \
               '{
                 model: "claude-haiku-4-5-20250901",
-                max_tokens: 2048,
+                max_tokens: 3000,
                 messages: [{
                   role: "user",
-                  content: ($prompt + "\n\nHere is the PR diff:\n\n```diff\n" + $diff + "\n```")
+                  content: ("You are a senior Ruby developer reviewing a PR for hexdump — a Ruby gem for self-hosted error tracking + logging.\n\nRules:\n- Be concise and constructive\n- Every issue MUST include a concrete suggested fix\n- Reference specific file names and line numbers\n- Check: thread safety, memory leaks, exception handling, credential leaks\n- Classify each finding by severity:\n  - 🔴 **critical** — bugs, security issues, data loss, broken functionality\n  - ⚠️ **suggestion** — code smells, missing edge cases, performance\n  - 💡 **nitpick** — style, naming, minor improvements\n  - ✅ **good** — well-written parts worth noting\n- If changes look fine, say so briefly — don'\''t invent issues\n- For PRs with " + $diff_lines + " changed lines or fewer that have zero critical/suggestion findings, add: **✅ Auto-approve candidate** — this PR looks safe to merge.\n\n" + $syntax + "\n\nFull codebase for context (so you understand the architecture):\n```ruby\n" + $codebase + "\n```\n\nPR diff to review:\n```diff\n" + $diff + "\n```\n\nFormat your response as:\n## Findings\n(list each finding with severity emoji, file:line, description, and suggested fix)\n\n## Summary\n(1-2 sentence overall assessment)")
                 }]
-              }')" | jq -r '.content[0].text')
+              }')" | jq -r '.content[0].text // "Review failed — could not parse API response."')
 
-          # Post review as PR comment
-          BODY="## 🤖 AI Code Review\n\n${REVIEW}\n\n---\n*Reviewed by Claude Haiku · [hexdump-ruby](https://github.com/bytecodehr/hexdump-ruby)*"
+          # Build comment body
+          TITLE="review'd by Claude 🤖"
+          BODY=$(cat <<EOF
+          ## ${TITLE}
 
-          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(echo -e "$BODY")"
+          ${REVIEW}
+
+          ---
+          *📊 Diff: ${DIFF_LINES} lines · Model: Claude Haiku 4.5 · [hexdump-ruby](https://github.com/bytecodehr/hexdump-ruby)*
+          EOF
+          )
+
+          # Delete previous bot review comments (smart re-reviews)
+          OLD_COMMENTS=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --jq '.[] | select(.body | contains("review'\''d by Claude")) | .id')
+          for cid in $OLD_COMMENTS; do
+            gh api -X DELETE "repos/$REPO/issues/$PR_NUMBER/comments/$cid" || true
+          done
+
+          # Post new review
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$BODY"
