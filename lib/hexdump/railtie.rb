@@ -32,11 +32,11 @@ module Hexdump
   end
 
   class ErrorSubscriber
-    def report(error, handled:, severity:, context: {})
-      Hexdump.capture(error, context: context.merge(
-        handled: handled,
-        severity: severity
-      ))
+    def report(error, handled:, severity:, context: {}, source: nil)
+      metadata = {handled: handled, severity: severity}
+      metadata[:source] = source if source
+
+      Hexdump.capture(error, context: context.merge(metadata))
     end
   end
 end
